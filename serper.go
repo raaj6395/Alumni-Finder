@@ -19,7 +19,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -45,14 +44,16 @@ type searcher struct {
 	ttl      time.Duration
 	client   *http.Client
 
-	mu   sync.Mutex // ponytail: global spacing between real calls; fine for one user
-	last time.Time
-	gap  time.Duration
+	sem chan struct{} // caps in-flight Serper calls
 }
 
 func newSearcher(db *sql.DB, key string, ttl time.Duration) *searcher {
 	return &searcher{db: db, key: key, endpoint: "https://google.serper.dev/search", ttl: ttl,
-		client: &http.Client{Timeout: 20 * time.Second}, gap: 300 * time.Millisecond}
+		sem: make(chan struct{}, 4),
+		// Reuse TLS connections across parallel calls (default keeps only 2 idle per host).
+		client: &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment, MaxIdleConnsPerHost: 8, IdleConnTimeout: 90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second, ForceAttemptHTTP2: true}}}
 }
 
 func (s *searcher) enabled() bool { return s.key != "" }
@@ -92,12 +93,12 @@ func (s *searcher) search(ctx context.Context, q string, page int, refresh bool)
 }
 
 func (s *searcher) fetch(ctx context.Context, q string, page int) ([]byte, error) {
-	s.mu.Lock()
-	if wait := s.gap - time.Since(s.last); wait > 0 {
-		time.Sleep(wait)
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	s.last = time.Now()
-	s.mu.Unlock()
 
 	reqBody, _ := json.Marshal(map[string]any{"q": q, "page": page, "num": 10})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, strings.NewReader(string(reqBody)))

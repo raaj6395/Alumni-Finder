@@ -45,7 +45,7 @@ func newTestApp(t *testing.T, key, endpoint string) http.Handler {
 	}
 	t.Cleanup(func() { db.Close() })
 	s := newSearcher(db, key, 24*time.Hour)
-	s.endpoint, s.gap = endpoint, 0
+	s.endpoint = endpoint
 	return (&app{db: db, s: s, schoolID: "15105506", variants: testVariants, maxPages: 3}).routes()
 }
 
@@ -196,3 +196,22 @@ func TestParseOrganicTolerant(t *testing.T) {
 }
 
 func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
+
+// Serper calls are network-bound; queries must run in parallel, not one after another.
+func TestSearchRunsQueriesConcurrently(t *testing.T) {
+	const latency = 300 * time.Millisecond
+	srv, calls := fakeSerper(t, func(q string, page int) (int, string) {
+		time.Sleep(latency)
+		return happyRoute(q, page)
+	})
+	h := newTestApp(t, "test-key", srv.URL)
+	start := time.Now()
+	var res searchResult
+	do(t, h, "POST", "/api/search", `{"name":"Razorpay"}`, &res)
+	took := time.Since(start)
+	t.Logf("%d calls in %v", *calls, took)
+	// Longest chain is the OR query's 2 pages; everything else overlaps it.
+	if took > 3*latency || len(res.People) != 3 {
+		t.Errorf("took %v for %d calls (%d people); want < %v", took, *calls, len(res.People), 3*latency)
+	}
+}

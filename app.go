@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 )
 
 type app struct {
@@ -179,41 +180,47 @@ func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult
 		return res, nil
 	}
 
-	// 1. Slug candidates. Search results are cached, so this is free on repeat visits.
+	// Slug lookup and all X-ray queries are independent network calls, so they run together.
 	guess := guessSlug(name)
-	var xerr error
+	var (
+		slugRes    []result
+		slugCached bool
+		slugErr    error
+		runs       []queryRun
+		wg         sync.WaitGroup
+	)
 	if a.s.enabled() {
-		results, cached, err := a.s.search(ctx, companyQuery(c.Name), 1, refresh)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slugRes, slugCached, slugErr = a.s.search(ctx, companyQuery(c.Name), 1, refresh)
+		}()
+		runs = a.xrayFetch(ctx, c.Name, refresh)
+		wg.Wait()
 		res.Summary.Queries++
 		res.Summary.Pages++
-		if cached {
+		if slugCached {
 			res.Summary.CacheHits++
 		}
-		if err != nil {
-			xerr = err // still save the guessed slug below so the alumni link works
-		}
-		seen := map[string]bool{}
-		for _, r := range results {
-			slug, err := companySlug(r.Link)
-			if err != nil || seen[slug] {
-				continue
-			}
-			seen[slug] = true
-			res.Candidates = append(res.Candidates, candidate{slug, r.Title, r.Snippet, "xray"})
-			if len(res.Candidates) == 5 {
-				break
-			}
-		}
 	}
-	pick := guess
-	source := "guess"
-	for _, cd := range res.Candidates {
-		if cd.Slug == guess {
-			pick, source = guess, "xray" // verified guess wins
+
+	// 1. Slug candidates.
+	seen := map[string]bool{}
+	for _, r := range slugRes {
+		slug, err := companySlug(r.Link)
+		if err != nil || seen[slug] {
+			continue
+		}
+		seen[slug] = true
+		res.Candidates = append(res.Candidates, candidate{slug, r.Title, r.Snippet, "xray"})
+		if len(res.Candidates) == 5 {
 			break
 		}
 	}
-	if source == "guess" && len(res.Candidates) > 0 {
+	pick, source := guess, "guess"
+	if containsSlug(res.Candidates, guess) {
+		source = "xray" // verified guess wins
+	} else if len(res.Candidates) > 0 {
 		pick, source = res.Candidates[0].Slug, "xray"
 	}
 	if !containsSlug(res.Candidates, guess) {
@@ -225,9 +232,15 @@ func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult
 		}
 	}
 
-	// 2. X-ray people search.
-	if xerr == nil && a.s.enabled() {
-		xerr = a.xray(ctx, id, c.Name, refresh, &res.Summary)
+	// 2. Store X-ray people (partial results too) in one transaction.
+	xerr := slugErr
+	if err := a.storePeople(ctx, id, c.Name, runs, &res.Summary); err != nil {
+		return nil, err
+	}
+	for _, r := range runs {
+		if xerr == nil {
+			xerr = r.err
+		}
 	}
 	if res.Company, err = a.getCompany(ctx, id); err != nil {
 		return nil, err
@@ -250,52 +263,89 @@ func containsSlug(cs []candidate, slug string) bool {
 	return false
 }
 
-func (a *app) xray(ctx context.Context, companyID int64, name string, refresh bool, sum *summary) error {
+// queryRun is what one X-ray query fetched across its pages.
+type queryRun struct {
+	hits             []result // profile results not already seen by another query
+	pages, cacheHits int
+	err              error
+}
+
+// xrayFetch runs every X-ray query in its own goroutine. Pages within a query stay sequential
+// because "stop when a page adds no new profiles" depends on the previous page.
+func (a *app) xrayFetch(ctx context.Context, name string, refresh bool) []queryRun {
+	qs := xrayQueries(name, a.variants)
+	runs := make([]queryRun, len(qs))
+	var mu sync.Mutex
 	seen := map[string]bool{}
-	for _, q := range xrayQueries(name, a.variants) {
+	var wg sync.WaitGroup
+	for i, q := range qs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := &runs[i]
+			for page := 1; page <= a.maxPages; page++ {
+				results, cached, err := a.s.search(ctx, q, page, refresh)
+				if err != nil {
+					r.err = err
+					return
+				}
+				r.pages++
+				if cached {
+					r.cacheHits++
+				}
+				fresh := 0
+				mu.Lock()
+				for _, res := range results {
+					if slug, _, err := profileSlug(res.Link); err == nil && !seen[slug] {
+						seen[slug] = true // non-profile results (posts, /pub/, etc.) are ignored
+						fresh++
+						r.hits = append(r.hits, res)
+					}
+				}
+				mu.Unlock()
+				if fresh == 0 {
+					return // page added no new profiles
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return runs
+}
+
+func (a *app) storePeople(ctx context.Context, companyID int64, name string, runs []queryRun, sum *summary) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, r := range runs {
 		sum.Queries++
-		for page := 1; page <= a.maxPages; page++ {
-			results, cached, err := a.s.search(ctx, q, page, refresh)
-			if err != nil {
+		sum.Pages += r.pages
+		sum.CacheHits += r.cacheHits
+		for _, res := range r.hits {
+			slug, url, _ := profileSlug(res.Link)
+			if err := a.upsertPerson(ctx, tx, companyID, name, slug, url, res, sum); err != nil {
 				return err
-			}
-			sum.Pages++
-			if cached {
-				sum.CacheHits++
-			}
-			fresh := 0
-			for _, r := range results {
-				slug, url, err := profileSlug(r.Link)
-				if err != nil || seen[slug] {
-					continue // non-profile results (posts, /pub/, etc.) are ignored
-				}
-				seen[slug] = true
-				fresh++
-				if err := a.upsertPerson(ctx, companyID, name, slug, url, r, sum); err != nil {
-					return err
-				}
-			}
-			if fresh == 0 {
-				break // page added no new profiles
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
-func (a *app) upsertPerson(ctx context.Context, companyID int64, company, slug, url string, r result, sum *summary) error {
+func (a *app) upsertPerson(ctx context.Context, tx *sql.Tx, companyID int64, company, slug, url string, r result, sum *summary) error {
 	pname, headline := parseTitle(r.Title)
 	sc := score(company, a.variants, r.Title, r.Snippet, headline)
 	reasons, _ := json.Marshal(sc.Reasons)
 
 	var existingCo int64
 	var coName string
-	err := a.db.QueryRowContext(ctx, `SELECT p.company_id, c.name FROM people p JOIN companies c ON c.id=p.company_id
+	err := tx.QueryRowContext(ctx, `SELECT p.company_id, c.name FROM people p JOIN companies c ON c.id=p.company_id
 		WHERE p.profile_slug=?`, slug).Scan(&existingCo, &coName)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		sum.New++
-		_, err = a.db.ExecContext(ctx, `INSERT INTO people(company_id, profile_url, profile_slug, name, headline, raw_title,
+		_, err = tx.ExecContext(ctx, `INSERT INTO people(company_id, profile_url, profile_slug, name, headline, raw_title,
 			snippet, score, confidence, score_reasons) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 			companyID, url, slug, pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, string(reasons))
 		return err
@@ -306,7 +356,7 @@ func (a *app) upsertPerson(ctx context.Context, companyID int64, company, slug, 
 		return nil
 	default: // refresh search data, keep tracker fields
 		sum.Updated++
-		_, err = a.db.ExecContext(ctx, `UPDATE people SET name=?, headline=?, raw_title=?, snippet=?, score=?, confidence=?,
+		_, err = tx.ExecContext(ctx, `UPDATE people SET name=?, headline=?, raw_title=?, snippet=?, score=?, confidence=?,
 			score_reasons=?, updated_at=datetime('now') WHERE profile_slug=?`,
 			pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, string(reasons), slug)
 		return err
