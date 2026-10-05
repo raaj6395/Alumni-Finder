@@ -1,0 +1,9 @@
+{"searchParameters":{"q":"site:linkedin.com/company \"Razorpay\"","type":"search","engine":"google"},
+ "organic":[
+  {"title":"Razorpay | LinkedIn","link":"https://in.linkedin.com/company/razorpay","snippet":"Razorpay | 1,234,567 followers on LinkedIn.","position":1},
+  {"title":"Razorpay Jobs | LinkedIn","link":"https://www.linkedin.com/company/razorpay/jobs?trk=x","snippet":"Jobs at Razorpay","position":2},
+  {"title":"RazorpayX | LinkedIn","link":"https://www.linkedin.com/company/razorpayx/","snippet":"Business banking by Razorpay","position":3},
+  {"title":"Razorpay Showcase","link":"https://www.linkedin.com/showcase/razorpay-capital/","snippet":"","position":4},
+  {"title":"A post","link":"https://www.linkedin.com/posts/someone_razorpay-activity-123","snippet":"","position":5}
+ ],
+ "credits":1}

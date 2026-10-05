@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MNNIT Alumni Finder</title>
+<style>
+:root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --line:#e3e3e3; --card:#f7f7f8; --acc:#0a66c2; --acc-fg:#fff;
+  --hi:#1f8a3b; --med:#b7791f; --lo:#888; --err-bg:#fdecec; --err:#a61b1b; --warn-bg:#fff7e0; }
+@media (prefers-color-scheme: dark) { :root { --bg:#121214; --fg:#e8e8ea; --muted:#9a9aa2; --line:#2a2a2f; --card:#1b1b1f;
+  --acc:#4c9be8; --acc-fg:#08111b; --hi:#4cc46d; --med:#e0a83e; --lo:#888; --err-bg:#3a1515; --err:#ff9b9b; --warn-bg:#3a3010; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, sans-serif; }
+header { display:flex; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+header h1 { font-size:16px; margin:0; } header .usage { margin-left:auto; color:var(--muted); font-size:12px; }
+main { max-width:1200px; margin:0 auto; padding:16px; }
+form { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+input, select, button { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+input[type=text] { min-width:0; }
+#name { flex:1 1 260px; font-size:16px; padding:9px 12px; }
+button { cursor:pointer; } button.primary { background:var(--acc); color:var(--acc-fg); border-color:var(--acc); font-weight:600; }
+button:disabled { opacity:.6; cursor:wait; }
+a { color:var(--acc); }
+.muted { color:var(--muted); } .small { font-size:12px; }
+.banner { padding:8px 12px; border-radius:6px; margin:12px 0; }
+.banner.err { background:var(--err-bg); color:var(--err); } .banner.warn { background:var(--warn-bg); }
+.chips { display:flex; gap:6px; flex-wrap:wrap; margin:12px 0; }
+.chip { border:1px solid var(--line); border-radius:999px; padding:2px 10px; font-size:12px; background:var(--card); cursor:pointer; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; margin:14px 0; }
+.big { display:inline-block; background:var(--acc); color:var(--acc-fg); padding:10px 16px; border-radius:6px; font-weight:600; text-decoration:none; }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.badge { display:inline-block; font-size:11px; padding:1px 7px; border-radius:999px; border:1px solid currentColor; white-space:nowrap; }
+.high { color:var(--hi); } .medium { color:var(--med); } .low { color:var(--lo); }
+.tablewrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { font-size:12px; color:var(--muted); font-weight:600; cursor:pointer; user-select:none; white-space:nowrap; }
+td.name { white-space:nowrap; font-weight:600; } td .snip { color:var(--muted); font-size:12px; margin-top:2px; }
+td input { width:100%; min-width:140px; padding:3px 6px; } td select { padding:3px 6px; }
+details summary { cursor:pointer; color:var(--muted); }
+.cand { padding:6px 0; border-top:1px solid var(--line); }
+kbd { font-size:11px; border:1px solid var(--line); border-radius:4px; padding:0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MNNIT Alumni Finder</h1>
+  <span class="muted small">Press <kbd>/</kbd> to search</span>
+  <span class="usage" id="usage"></span>
+</header>
+<main>
+  <div id="cfgBanner"></div>
+  <form id="f">
+    <input id="name" type="text" placeholder="Company name, e.g. Razorpay" autocomplete="off" autofocus aria-label="Company name">
+    <button class="primary" id="go">Find alumni</button>
+    <label class="small"><input type="checkbox" id="refresh"> Refresh (skip cache, uses API credits)</label>
+  </form>
+  <div class="chips" id="recent"></div>
+  <div id="out"></div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATUSES = ['new','request_sent','accepted','messaged','replied','referred','not_relevant','no_response'];
+let cur = null, sortKey = 'score', sortDir = -1, confFilter = '', statusFilter = '', textFilter = '';
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: body ? {'Content-Type':'application/json'} : {}, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({ error: { code: 'bad_response', message: `HTTP ${r.status}, non-JSON response` } }));
+  if (j && j.error) throw new Error(`${j.error.code}: ${j.error.message}`);
+  return j;
+}
+const showErr = e => { $('#out').innerHTML = `<div class="banner err">${esc(e.message || e)}</div>`; };
+
+async function loadUsage() {
+  try { const u = await api('GET', '/api/usage'); $('#usage').textContent = `Serper calls — today: ${u.today} · all-time: ${u.total}`; }
+  catch (e) { $('#usage').textContent = 'usage unavailable: ' + e.message; }
+}
+async function loadRecent() {
+  try {
+    const cs = await api('GET', '/api/companies');
+    $('#recent').innerHTML = cs.map(c => `<span class="chip" data-id="${c.id}">${esc(c.name)} · ${c.people}</span>`).join('');
+  } catch (e) { $('#recent').innerHTML = `<span class="banner err">${esc(e.message)}</span>`; }
+}
+$('#recent').onclick = e => { const id = e.target.dataset.id; if (id) location.hash = '#c' + id; };
+
+$('#f').onsubmit = async e => {
+  e.preventDefault();
+  const name = $('#name').value.trim(); if (!name) return;
+  $('#go').disabled = true; $('#go').textContent = 'Searching…';
+  $('#out').innerHTML = '<p class="muted">Searching Google for MNNIT alumni… (each uncached page costs 1 Serper credit)</p>';
+  try {
+    cur = await api('POST', '/api/search', { name, refresh: $('#refresh').checked });
+    $('#refresh').checked = false;
+    history.replaceState(null, '', '#c' + cur.company.id);
+    render();
+  } catch (err) { showErr(err); }
+  finally { $('#go').disabled = false; $('#go').textContent = 'Find alumni'; loadUsage(); loadRecent(); }
+};
+
+async function openFromHash() {
+  const m = location.hash.match(/^#c(\d+)$/); if (!m) return;
+  if (cur && cur.company.id == m[1]) return;
+  try { cur = await api('GET', '/api/companies/' + m[1]); $('#name').value = cur.company.name; render(); } catch (e) { showErr(e); }
+}
+window.onhashchange = openFromHash;
+
+function render() {
+  const { company: c, candidates, summary: s } = cur;
+  const srcLabel = { xray: 'found via search', guess: 'guessed, unverified', manual: 'set manually' }[c.slug_source] || '';
+  let h = '';
+  if (s.error) h += `<div class="banner err"><b>${esc(s.error.code)}</b>: ${esc(s.error.message)}${cur.people.length ? ' — showing results fetched so far.' : ''}</div>`;
+  h += `<div class="card">
+    <div class="row"><h2 style="margin:0;font-size:18px">${esc(c.name)}</h2>
+      ${c.slug ? `<span class="muted small">slug <code>${esc(c.slug)}</code> · ${srcLabel}</span>` : ''}</div>
+    ${c.slug ? `<div class="row" style="margin-top:10px">
+      <a class="big" href="${esc(c.alumni_url)}" target="_blank" rel="noopener">Open MNNIT alumni on LinkedIn ↗</a>
+      <button type="button" id="copy">Copy link</button>
+      <a href="${esc(c.company_url)}" target="_blank" rel="noopener" class="small">company page</a></div>` : ''}
+    <details style="margin-top:10px"${c.slug_source === 'guess' ? ' open' : ''}><summary>Wrong company? Pick another slug</summary>
+      ${candidates.map(cd => `<div class="cand row"><button type="button" data-slug="${esc(cd.slug)}" data-src="${cd.source}">Use</button>
+        <code>${esc(cd.slug)}</code>${cd.source === 'guess' ? ' <span class="badge low">guessed, unverified</span>' : ''}
+        <span class="small">${esc(cd.title)}</span> <span class="muted small">${esc(cd.snippet)}</span></div>`).join('')}
+      <form class="cand" id="manual"><input type="text" id="manualSlug" placeholder="Paste linkedin.com/company/… URL or slug" style="flex:1">
+        <button>Save</button></form>
+    </details>
+  </div>`;
+  if (!s.xray_active) h += `<div class="banner warn">X-ray search is off (no SERPER_API_KEY). Use the alumni link above.</div>`;
+  else if (s.queries) h += `<p class="muted small">${s.queries} queries · ${s.pages} pages · ${s.cache_hits} from cache · ${s.new} new · ${s.updated} updated
+    ${s.elsewhere.length ? `· ${s.elsewhere.length} already tracked under another company: ${esc(s.elsewhere.join(', '))}` : ''}</p>`;
+  h += `<div class="row" style="margin:8px 0">
+    <strong>${cur.people.length} profiles</strong>
+    <select id="conf"><option value="">All confidence</option><option>high</option><option>medium</option><option>low</option></select>
+    <select id="stf"><option value="">All statuses</option>${STATUSES.map(x => `<option>${x}</option>`).join('')}</select>
+    <input type="text" id="tf" placeholder="Filter text…"></div><div id="tbl"></div>`;
+  $('#out').innerHTML = h;
+  $('#conf').value = confFilter; $('#stf').value = statusFilter; $('#tf').value = textFilter;
+  $('#conf').onchange = e => { confFilter = e.target.value; renderTable(); };
+  $('#stf').onchange = e => { statusFilter = e.target.value; renderTable(); };
+  $('#tf').oninput = e => { textFilter = e.target.value.toLowerCase(); renderTable(); };
+  if ($('#copy')) $('#copy').onclick = async e => { await navigator.clipboard.writeText(c.alumni_url); e.target.textContent = 'Copied ✓'; };
+  $('#out').querySelectorAll('[data-slug]').forEach(b => b.onclick = () => saveSlug(b.dataset.slug, b.dataset.src));
+  $('#manual').onsubmit = e => { e.preventDefault(); saveSlug($('#manualSlug').value, 'manual'); };
+  renderTable();
+}
+
+async function saveSlug(slug, source) {
+  try { cur.company = await api('PATCH', `/api/companies/${cur.company.id}`, { slug, source }); render(); }
+  catch (e) { alert(e.message); }
+}
+
+function renderTable() {
+  const rows = cur.people
+    .filter(p => (!confFilter || p.confidence === confFilter) && (!statusFilter || p.status === statusFilter))
+    .filter(p => !textFilter || (p.name + ' ' + p.headline + ' ' + p.snippet + ' ' + p.notes).toLowerCase().includes(textFilter))
+    .sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : a[sortKey] < b[sortKey] ? -1 : 0) * sortDir);
+  if (!cur.people.length) {
+    $('#tbl').innerHTML = cur.summary.xray_active
+      ? '<p class="muted">No public profiles found via Google. Try the LinkedIn alumni link above — it shows everyone, including private-search profiles.</p>' : '';
+    return;
+  }
+  const arrow = k => sortKey === k ? (sortDir < 0 ? ' ↓' : ' ↑') : '';
+  $('#tbl').innerHTML = `<div class="tablewrap"><table><thead><tr>
+    <th data-k="score">Score${arrow('score')}</th><th data-k="name">Name${arrow('name')}</th><th data-k="headline">Headline / snippet${arrow('headline')}</th>
+    <th data-k="status">Status${arrow('status')}</th><th>Notes</th></tr></thead><tbody>
+    ${rows.map(p => `<tr data-id="${p.id}">
+      <td title="${esc((p.reasons || []).join('\n'))}"><span class="badge ${p.confidence}">${p.confidence} ${p.score}</span></td>
+      <td class="name"><a href="${esc(p.profile_url)}" target="_blank" rel="noopener">${esc(p.name || p.raw_title)}</a></td>
+      <td>${esc(p.headline)}<div class="snip">${esc(p.snippet)}</div></td>
+      <td><select data-f="status">${STATUSES.map(x => `<option${x === p.status ? ' selected' : ''}>${x}</option>`).join('')}</select></td>
+      <td><input type="text" data-f="notes" value="${esc(p.notes)}" placeholder="notes"></td></tr>`).join('')}
+    </tbody></table></div>`;
+  $('#tbl').querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {
+    sortDir = sortKey === th.dataset.k ? -sortDir : (th.dataset.k === 'score' ? -1 : 1); sortKey = th.dataset.k; renderTable(); });
+  $('#tbl').querySelectorAll('[data-f]').forEach(el => el.onchange = async () => {
+    const id = +el.closest('tr').dataset.id, f = el.dataset.f;
+    try { await api('PATCH', '/api/people/' + id, { [f]: el.value }); cur.people.find(p => p.id === id)[f] = el.value; el.style.outline = ''; }
+    catch (e) { el.style.outline = '2px solid var(--err)'; alert('Save failed: ' + e.message); }
+  });
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) { e.preventDefault(); $('#name').focus(); $('#name').select(); }
+});
+
+api('GET', '/api/config').then(c => {
+  if (!c.xray_enabled) $('#cfgBanner').innerHTML = '<div class="banner warn">SERPER_API_KEY not set — only LinkedIn alumni links are available. Add it to .env and restart for Google X-ray profile search.</div>';
+}).catch(showErr);
+loadUsage(); loadRecent(); openFromHash();
+</script>
+</body>
+</html>
