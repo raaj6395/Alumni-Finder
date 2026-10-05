@@ -7,7 +7,7 @@ dev:
 	go run .
 
 build:
-	go build -o bin/alumni .
+	go build -trimpath -ldflags="-s -w" -o bin/alumni .
 
 test:
 	go test ./...
