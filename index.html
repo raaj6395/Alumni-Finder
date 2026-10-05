@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MNNIT Alumni Finder</title>
+<title>Alumni Finder</title>
 <style>
 :root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --line:#e3e3e3; --card:#f7f7f8; --acc:#0a66c2; --acc-fg:#fff;
   --hi:#1f8a3b; --med:#b7791f; --lo:#888; --err-bg:#fdecec; --err:#a61b1b; --warn-bg:#fff7e0; }
@@ -44,13 +44,14 @@ kbd { font-size:11px; border:1px solid var(--line); border-radius:4px; padding:0
 </head>
 <body>
 <header>
-  <h1>MNNIT Alumni Finder</h1>
+  <h1>Alumni Finder</h1>
   <span class="muted small">Press <kbd>/</kbd> to search</span>
   <span class="usage" id="usage"></span>
 </header>
 <main>
   <div id="cfgBanner"></div>
   <form id="f">
+    <select id="school" aria-label="College" title="College"></select>
     <input id="name" type="text" placeholder="Company name, e.g. Razorpay" autocomplete="off" autofocus aria-label="Company name">
     <button class="primary" id="go">Find alumni</button>
     <label class="small"><input type="checkbox" id="refresh"> Refresh (skip cache, uses API credits)</label>
@@ -82,26 +83,34 @@ async function loadRecent() {
     $('#recent').innerHTML = cs.map(c => `<span class="chip" data-id="${c.id}">${esc(c.name)} · ${c.people}</span>`).join('');
   } catch (e) { $('#recent').innerHTML = `<span class="banner err">${esc(e.message)}</span>`; }
 }
-$('#recent').onclick = e => { const id = e.target.dataset.id; if (id) location.hash = '#c' + id; };
+const school = () => $('#school').value;
+const hashFor = id => '#c' + id + '/' + school();
+$('#recent').onclick = e => { const id = e.target.dataset.id; if (id) location.hash = hashFor(id); };
+// Switching college reloads the open company from the DB (no API call); press Find to search Google.
+$('#school').onchange = () => {
+  try { localStorage.setItem('school', school()); } catch {}
+  if (cur) location.hash = hashFor(cur.company.id);
+};
 
 $('#f').onsubmit = async e => {
   e.preventDefault();
   const name = $('#name').value.trim(); if (!name) return;
   $('#go').disabled = true; $('#go').textContent = 'Searching…';
-  $('#out').innerHTML = '<p class="muted">Searching Google for MNNIT alumni… (each uncached page costs 1 Serper credit)</p>';
+  $('#out').innerHTML = `<p class="muted">Searching Google for ${esc($('#school').selectedOptions[0].text)} alumni… (each uncached page costs 1 Serper credit)</p>`;
   try {
-    cur = await api('POST', '/api/search', { name, refresh: $('#refresh').checked });
+    cur = await api('POST', '/api/search', { name, school: school(), refresh: $('#refresh').checked });
     $('#refresh').checked = false;
-    history.replaceState(null, '', '#c' + cur.company.id);
+    history.replaceState(null, '', hashFor(cur.company.id));
     render();
   } catch (err) { showErr(err); }
   finally { $('#go').disabled = false; $('#go').textContent = 'Find alumni'; loadUsage(); loadRecent(); }
 };
 
 async function openFromHash() {
-  const m = location.hash.match(/^#c(\d+)$/); if (!m) return;
-  if (cur && cur.company.id == m[1]) return;
-  try { cur = await api('GET', '/api/companies/' + m[1]); $('#name').value = cur.company.name; render(); } catch (e) { showErr(e); }
+  const m = location.hash.match(/^#c(\d+)(?:\/(\w+))?$/); if (!m) return;
+  if (m[2] && [...$('#school').options].some(o => o.value === m[2])) $('#school').value = m[2];
+  if (cur && cur.company.id == m[1] && cur.school.key === school()) return;
+  try { cur = await api('GET', `/api/companies/${m[1]}?school=${school()}`); $('#name').value = cur.company.name; render(); } catch (e) { showErr(e); }
 }
 window.onhashchange = openFromHash;
 
@@ -114,7 +123,7 @@ function render() {
     <div class="row"><h2 style="margin:0;font-size:18px">${esc(c.name)}</h2>
       ${c.slug ? `<span class="muted small">slug <code>${esc(c.slug)}</code> · ${srcLabel}</span>` : ''}</div>
     ${c.slug ? `<div class="row" style="margin-top:10px">
-      <a class="big" href="${esc(c.alumni_url)}" target="_blank" rel="noopener">Open MNNIT alumni on LinkedIn ↗</a>
+      <a class="big" href="${esc(c.alumni_url)}" target="_blank" rel="noopener">Open ${esc(cur.school.name)} alumni on LinkedIn ↗</a>
       <button type="button" id="copy">Copy link</button>
       <a href="${esc(c.company_url)}" target="_blank" rel="noopener" class="small">company page</a></div>` : ''}
     <details style="margin-top:10px"${c.slug_source === 'guess' ? ' open' : ''}><summary>Wrong company? Pick another slug</summary>
@@ -145,7 +154,7 @@ function render() {
 }
 
 async function saveSlug(slug, source) {
-  try { cur.company = await api('PATCH', `/api/companies/${cur.company.id}`, { slug, source }); render(); }
+  try { cur.company = await api('PATCH', `/api/companies/${cur.company.id}?school=${cur.school.key}`, { slug, source }); render(); }
   catch (e) { alert(e.message); }
 }
 
@@ -184,9 +193,12 @@ document.addEventListener('keydown', e => {
 });
 
 api('GET', '/api/config').then(c => {
+  $('#school').innerHTML = c.schools.map(s => `<option value="${esc(s.key)}">${esc(s.name)}</option>`).join('');
+  try { const saved = localStorage.getItem('school'); if (saved && c.schools.some(s => s.key === saved)) $('#school').value = saved; } catch {}
+  openFromHash();
   if (!c.xray_enabled) $('#cfgBanner').innerHTML = '<div class="banner warn">SERPER_API_KEY not set — only LinkedIn alumni links are available. Add it to .env and restart for Google X-ray profile search.</div>';
 }).catch(showErr);
-loadUsage(); loadRecent(); openFromHash();
+loadUsage(); loadRecent();
 </script>
 </body>
 </html>

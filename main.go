@@ -39,18 +39,15 @@ func main() {
 		slog.Error("open db", "err", err)
 		os.Exit(1)
 	}
-	var variants []string
-	for _, v := range strings.Split(env("SCHOOL_NAME_VARIANTS", "MNNIT,Motilal Nehru National Institute of Technology,MNNIT Allahabad,NIT Allahabad"), ",") {
-		if v = strings.TrimSpace(v); v != "" {
-			variants = append(variants, v)
-		}
-	}
 	a := &app{
 		db:       db,
 		s:        newSearcher(db, os.Getenv("SERPER_API_KEY"), time.Duration(envInt("CACHE_TTL_DAYS", 7))*24*time.Hour),
-		schoolID: env("SCHOOL_ID", "15105506"),
-		variants: variants,
 		maxPages: envInt("XRAY_MAX_PAGES", 3),
+	}
+	for _, k := range []string{"SCHOOL_ID", "SCHOOL_NAME_VARIANTS"} {
+		if os.Getenv(k) != "" {
+			slog.Warn("env var is ignored now; colleges are configured in schools.go", "var", k)
+		}
 	}
 	if !a.s.enabled() {
 		slog.Warn("SERPER_API_KEY not set: X-ray search disabled, alumni links still work")
@@ -70,34 +67,43 @@ func (a *app) routes() http.Handler {
 		w.Write(indexHTML)
 	})
 	m.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"xray_enabled": a.s.enabled(), "school_id": a.schoolID, "variants": a.variants})
+		writeJSON(w, map[string]any{"xray_enabled": a.s.enabled(), "schools": schools})
 	})
 	m.HandleFunc("GET /api/usage", handle(func(r *http.Request) (any, error) { return a.usage(r.Context()) }))
 	m.HandleFunc("GET /api/companies", handle(func(r *http.Request) (any, error) { return a.listCompanies(r.Context()) }))
 	m.HandleFunc("POST /api/search", handle(func(r *http.Request) (any, error) {
 		var in struct {
 			Name    string `json:"name"`
+			School  string `json:"school"`
 			Refresh bool   `json:"refresh"`
 		}
 		if err := decode(r, &in); err != nil {
 			return nil, err
 		}
+		sc, err := schoolByKey(in.School)
+		if err != nil {
+			return nil, err
+		}
 		// Detach from the request so a closed tab doesn't abort a half-stored run.
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Minute)
 		defer cancel()
-		return a.run(ctx, in.Name, in.Refresh)
+		return a.run(ctx, in.Name, sc, in.Refresh)
 	}))
 	m.HandleFunc("GET /api/companies/{id}", handle(func(r *http.Request) (any, error) {
 		id, err := pathID(r)
 		if err != nil {
 			return nil, err
 		}
-		c, err := a.getCompany(r.Context(), id)
+		sc, err := schoolByKey(r.URL.Query().Get("school"))
 		if err != nil {
 			return nil, err
 		}
-		people, err := a.listPeople(r.Context(), id)
-		return &searchResult{Company: c, People: people, Candidates: []candidate{},
+		c, err := a.getCompany(r.Context(), id, sc)
+		if err != nil {
+			return nil, err
+		}
+		people, err := a.listPeople(r.Context(), id, sc.Key)
+		return &searchResult{School: sc, Company: c, People: people, Candidates: []candidate{},
 			Summary: summary{XrayActive: a.s.enabled(), Elsewhere: []string{}}}, err
 	}))
 	m.HandleFunc("PATCH /api/companies/{id}", handle(func(r *http.Request) (any, error) {
@@ -118,7 +124,11 @@ func (a *app) routes() http.Handler {
 		if err := a.setSlug(r.Context(), id, in.Slug, in.Source); err != nil {
 			return nil, err
 		}
-		return a.getCompany(r.Context(), id)
+		sc, err := schoolByKey(r.URL.Query().Get("school"))
+		if err != nil {
+			return nil, err
+		}
+		return a.getCompany(r.Context(), id, sc)
 	}))
 	m.HandleFunc("PATCH /api/people/{id}", handle(func(r *http.Request) (any, error) {
 		id, err := pathID(r)

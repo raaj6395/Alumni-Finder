@@ -1,12 +1,15 @@
-# MNNIT Alumni Finder
+# Alumni Finder
 
-Type a company name and get MNNIT Allahabad alumni who work there, so you can ask them for referrals.
+Pick your college (MNNIT Allahabad or IIT Roorkee), type a company name, and get alumni who work there, so you can ask them for referrals.
 
 - **LinkedIn alumni link**: finds the company's LinkedIn slug and builds
-  `linkedin.com/company/{slug}/people/?facetSchool=15105506`. Open it while logged in to see everyone.
-- **Google X-ray** (needs a Serper.dev key): searches `site:linkedin.com/in "MNNIT" "{company}"` and
+  `linkedin.com/company/{slug}/people/?facetSchool={school id}`. Open it while logged in to see everyone.
+- **Google X-ray** (needs a Serper.dev key): searches `site:linkedin.com/in "{college}" "{company}"` and
   similar queries, then ranks the profiles with simple rules. Hover over a score to see why it got that score.
 - **Tracker**: set a status and notes for each person. Re-running a search keeps them.
+
+To add a college, add a line to `schools.go` with its LinkedIn school id and the names alumni use on
+their profiles.
 
 The app never sends requests to linkedin.com. It only builds links for you to open.
 

@@ -12,8 +12,6 @@ import (
 type app struct {
 	db       *sql.DB
 	s        *searcher
-	schoolID string
-	variants []string
 	maxPages int
 }
 
@@ -65,20 +63,21 @@ type errJSON struct {
 }
 
 type searchResult struct {
+	School     school      `json:"school"`
 	Company    company     `json:"company"`
 	Candidates []candidate `json:"candidates"`
 	People     []person    `json:"people"`
 	Summary    summary     `json:"summary"`
 }
 
-func (a *app) withURLs(c company) company {
+func withURLs(c company, sc school) company {
 	if c.Slug != "" {
-		c.AlumniURL, c.CompanyURL = alumniURL(c.Slug, a.schoolID), companyURL(c.Slug)
+		c.AlumniURL, c.CompanyURL = alumniURL(c.Slug, sc.ID), companyURL(c.Slug)
 	}
 	return c
 }
 
-func (a *app) getCompany(ctx context.Context, id int64) (company, error) {
+func (a *app) getCompany(ctx context.Context, id int64, sc school) (company, error) {
 	var c company
 	err := a.db.QueryRowContext(ctx, `SELECT c.id, c.name, c.slug, c.slug_source,
 		(SELECT count(*) FROM people p WHERE p.company_id = c.id) FROM companies c WHERE c.id=?`, id).
@@ -86,7 +85,7 @@ func (a *app) getCompany(ctx context.Context, id int64) (company, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, &apiError{404, "not_found", "company not found"}
 	}
-	return a.withURLs(c), err
+	return withURLs(c, sc), err
 }
 
 func (a *app) listCompanies(ctx context.Context) ([]company, error) {
@@ -102,14 +101,14 @@ func (a *app) listCompanies(ctx context.Context) ([]company, error) {
 		if err := rows.Scan(&c.ID, &c.Name, &c.Slug, &c.SlugSource, &c.People); err != nil {
 			return nil, err
 		}
-		out = append(out, a.withURLs(c))
+		out = append(out, withURLs(c, schools[0]))
 	}
 	return out, rows.Err()
 }
 
-func (a *app) listPeople(ctx context.Context, companyID int64) ([]person, error) {
+func (a *app) listPeople(ctx context.Context, companyID int64, schoolKey string) ([]person, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT id, profile_url, name, headline, raw_title, snippet, score,
-		confidence, score_reasons, status, notes FROM people WHERE company_id=? ORDER BY score DESC, name`, companyID)
+		confidence, score_reasons, status, notes FROM people WHERE company_id=? AND school=? ORDER BY score DESC, name`, companyID, schoolKey)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +153,7 @@ func (a *app) setSlug(ctx context.Context, id int64, input, source string) error
 }
 
 // run is the whole "type a company, get alumni" flow.
-func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult, error) {
+func (a *app) run(ctx context.Context, name string, sc school, refresh bool) (*searchResult, error) {
 	name = strings.TrimSpace(name)
 	norm := normalizeName(name)
 	if norm == "" {
@@ -166,11 +165,11 @@ func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult
 	if err != nil {
 		return nil, err
 	}
-	c, err := a.getCompany(ctx, id)
+	c, err := a.getCompany(ctx, id, sc)
 	if err != nil {
 		return nil, err
 	}
-	res := &searchResult{Summary: summary{XrayActive: a.s.enabled(), Elsewhere: []string{}}}
+	res := &searchResult{School: sc, Summary: summary{XrayActive: a.s.enabled(), Elsewhere: []string{}}}
 	fail := func(err error) (*searchResult, error) {
 		var ae *apiError
 		if !errors.As(err, &ae) {
@@ -195,7 +194,7 @@ func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult
 			defer wg.Done()
 			slugRes, slugCached, slugErr = a.s.search(ctx, companyQuery(c.Name), 1, refresh)
 		}()
-		runs = a.xrayFetch(ctx, c.Name, refresh)
+		runs = a.xrayFetch(ctx, c.Name, sc, refresh)
 		wg.Wait()
 		res.Summary.Queries++
 		res.Summary.Pages++
@@ -234,7 +233,7 @@ func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult
 
 	// 2. Store X-ray people (partial results too) in one transaction.
 	xerr := slugErr
-	if err := a.storePeople(ctx, id, c.Name, runs, &res.Summary); err != nil {
+	if err := a.storePeople(ctx, id, c.Name, sc, runs, &res.Summary); err != nil {
 		return nil, err
 	}
 	for _, r := range runs {
@@ -242,10 +241,10 @@ func (a *app) run(ctx context.Context, name string, refresh bool) (*searchResult
 			xerr = r.err
 		}
 	}
-	if res.Company, err = a.getCompany(ctx, id); err != nil {
+	if res.Company, err = a.getCompany(ctx, id, sc); err != nil {
 		return nil, err
 	}
-	if res.People, err = a.listPeople(ctx, id); err != nil {
+	if res.People, err = a.listPeople(ctx, id, sc.Key); err != nil {
 		return nil, err
 	}
 	if xerr != nil {
@@ -272,8 +271,8 @@ type queryRun struct {
 
 // xrayFetch runs every X-ray query in its own goroutine. Pages within a query stay sequential
 // because "stop when a page adds no new profiles" depends on the previous page.
-func (a *app) xrayFetch(ctx context.Context, name string, refresh bool) []queryRun {
-	qs := xrayQueries(name, a.variants)
+func (a *app) xrayFetch(ctx context.Context, name string, sc school, refresh bool) []queryRun {
+	qs := xrayQueries(name, sc.Variants)
 	runs := make([]queryRun, len(qs))
 	var mu sync.Mutex
 	seen := map[string]bool{}
@@ -313,7 +312,7 @@ func (a *app) xrayFetch(ctx context.Context, name string, refresh bool) []queryR
 	return runs
 }
 
-func (a *app) storePeople(ctx context.Context, companyID int64, name string, runs []queryRun, sum *summary) error {
+func (a *app) storePeople(ctx context.Context, companyID int64, name string, sc school, runs []queryRun, sum *summary) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -325,7 +324,7 @@ func (a *app) storePeople(ctx context.Context, companyID int64, name string, run
 		sum.CacheHits += r.cacheHits
 		for _, res := range r.hits {
 			slug, url, _ := profileSlug(res.Link)
-			if err := a.upsertPerson(ctx, tx, companyID, name, slug, url, res, sum); err != nil {
+			if err := a.upsertPerson(ctx, tx, companyID, name, sc, slug, url, res, sum); err != nil {
 				return err
 			}
 		}
@@ -333,26 +332,27 @@ func (a *app) storePeople(ctx context.Context, companyID int64, name string, run
 	return tx.Commit()
 }
 
-func (a *app) upsertPerson(ctx context.Context, tx *sql.Tx, companyID int64, company, slug, url string, r result, sum *summary) error {
+func (a *app) upsertPerson(ctx context.Context, tx *sql.Tx, companyID int64, company string, sch school, slug, url string, r result, sum *summary) error {
 	pname, headline := parseTitle(r.Title)
-	sc := score(company, a.variants, r.Title, r.Snippet, headline)
+	sc := score(company, sch.Variants, r.Title, r.Snippet, headline)
 	reasons, _ := json.Marshal(sc.Reasons)
 
 	var existingCo int64
-	var coName string
-	err := tx.QueryRowContext(ctx, `SELECT p.company_id, c.name FROM people p JOIN companies c ON c.id=p.company_id
-		WHERE p.profile_slug=?`, slug).Scan(&existingCo, &coName)
+	var coName, existingSchool string
+	err := tx.QueryRowContext(ctx, `SELECT p.company_id, c.name, p.school FROM people p JOIN companies c ON c.id=p.company_id
+		WHERE p.profile_slug=?`, slug).Scan(&existingCo, &coName, &existingSchool)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		sum.New++
-		_, err = tx.ExecContext(ctx, `INSERT INTO people(company_id, profile_url, profile_slug, name, headline, raw_title,
-			snippet, score, confidence, score_reasons) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-			companyID, url, slug, pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, string(reasons))
+		_, err = tx.ExecContext(ctx, `INSERT INTO people(company_id, school, profile_url, profile_slug, name, headline, raw_title,
+			snippet, score, confidence, score_reasons) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			companyID, sch.Key, url, slug, pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, string(reasons))
 		return err
 	case err != nil:
 		return err
-	case existingCo != companyID:
-		sum.Elsewhere = append(sum.Elsewhere, pname+" (already under "+coName+")")
+	case existingCo != companyID || existingSchool != sch.Key:
+		// One row per person: keep the first company/school that found them, untouched.
+		sum.Elsewhere = append(sum.Elsewhere, pname+" (already under "+coName+" · "+existingSchool+")")
 		return nil
 	default: // refresh search data, keep tracker fields
 		sum.Updated++

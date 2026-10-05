@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,7 +48,7 @@ func newTestApp(t *testing.T, key, endpoint string) http.Handler {
 	t.Cleanup(func() { db.Close() })
 	s := newSearcher(db, key, 24*time.Hour)
 	s.endpoint = endpoint
-	return (&app{db: db, s: s, schoolID: "15105506", variants: testVariants, maxPages: 3}).routes()
+	return (&app{db: db, s: s, maxPages: 3}).routes()
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string, out any) int {
@@ -192,6 +194,49 @@ func TestParseOrganicTolerant(t *testing.T) {
 	}
 	if _, err := parseOrganic([]byte("<html>")); err == nil {
 		t.Error("garbage should be a parse error")
+	}
+}
+
+func TestSchoolsAreSeparate(t *testing.T) {
+	var mu sync.Mutex
+	var queries []string
+	srv, _ := fakeSerper(t, func(q string, page int) (int, string) {
+		mu.Lock()
+		queries = append(queries, q)
+		mu.Unlock()
+		return happyRoute(q, page)
+	})
+	h := newTestApp(t, "test-key", srv.URL)
+
+	var mnnit, iitr searchResult
+	do(t, h, "POST", "/api/search", `{"name":"Razorpay","school":"mnnit"}`, &mnnit)
+	queries = nil
+	do(t, h, "POST", "/api/search", `{"name":"Razorpay","school":"iitr"}`, &iitr)
+
+	if iitr.School.Key != "iitr" || iitr.Company.AlumniURL != "https://www.linkedin.com/company/razorpay/people/?facetSchool=157269" {
+		t.Errorf("iitr company = %+v", iitr.Company)
+	}
+	for _, q := range queries {
+		if strings.Contains(q, "MNNIT") {
+			t.Errorf("IIT Roorkee search sent an MNNIT query: %s", q)
+		}
+	}
+	if !slices.Contains(queries, `site:linkedin.com/in ("IIT Roorkee" OR "Indian Institute of Technology Roorkee") "Razorpay"`) {
+		t.Errorf("queries = %q", queries)
+	}
+	// Fixture profiles were stored under MNNIT first; the IITR list stays scoped to IITR.
+	if len(mnnit.People) != 3 || len(iitr.People) != 0 || len(iitr.Summary.Elsewhere) != 3 || iitr.Summary.Updated != 0 {
+		t.Errorf("mnnit=%d iitr=%d people, summary=%+v", len(mnnit.People), len(iitr.People), iitr.Summary)
+	}
+	// MNNIT scores must not be recomputed with IIT Roorkee's names.
+	var again searchResult
+	do(t, h, "GET", "/api/companies/"+itoa(mnnit.Company.ID)+"?school=mnnit", "", &again)
+	if again.People[0].Score != mnnit.People[0].Score {
+		t.Errorf("score changed %d -> %d", mnnit.People[0].Score, again.People[0].Score)
+	}
+	var e map[string]errJSON
+	if code := do(t, h, "POST", "/api/search", `{"name":"Razorpay","school":"xyz"}`, &e); code != 400 || e["error"].Code != "bad_school" {
+		t.Errorf("unknown school: %d %+v", code, e)
 	}
 }
 
