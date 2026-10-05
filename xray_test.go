@@ -44,6 +44,37 @@ func TestParseTitle(t *testing.T) {
 	}
 }
 
+func TestDegreeAt(t *testing.T) {
+	tests := []struct{ title, snippet, want string }{
+		{"Asha - SDE - Google | LinkedIn", "Education: MNNIT Allahabad · Location: Bengaluru", ""},
+		{"Asha - SDE - Google | LinkedIn", "B.Tech from MNNIT Allahabad, 2019", "btech"},
+		{"Asha - SDE | LinkedIn", "Motilal Nehru National Institute of Technology. Bachelor of Technology - BTech, CSE", "btech"},
+		{"Asha - SDE | LinkedIn", "MNNIT Allahabad - B.E. Computer Science", "btech"},
+		{"Ravi - M.Tech MNNIT | LinkedIn", "", "pg"},
+		{"Ravi - SDE | LinkedIn", "Master of Technology - MTech. MNNIT Allahabad", "pg"},
+		{"Ravi - SDE | LinkedIn", "MCA, MNNIT Allahabad", "pg"},
+		{"Ravi - SDE | LinkedIn", "MNNIT Allahabad · MBA", "pg"},
+		{"Ravi - SDE | LinkedIn", "PhD scholar at MNNIT", "pg"},
+		{"Ravi - SDE | LinkedIn", "MNNIT Allahabad, M.E. VLSI", "pg"},
+		{"Ravi - SDE | LinkedIn", "Dual Degree (B.Tech + M.Tech), IIT Roorkee", ""}, // not this school's variants
+		{"Ravi | LinkedIn", "Dual Degree (B.Tech + M.Tech), MNNIT", "btech"},
+		{"Ravi | LinkedIn", "M.Tech IIT Bombay. Experience at Google, Microsoft, Amazon and others. Education: MNNIT Allahabad", ""},
+		{"Ravi | LinkedIn", "me and my team at MNNIT", ""}, // "me" is not M.E.
+		{"Aman - SWE | LinkedIn", "B-Tech in Electrical Engineering at MNNIT (2020-2024)", "btech"},
+		{"Sahaj - Ex Intern @Cisco || CSE '26 @MNNIT | LinkedIn", "", "btech"},
+		{"Arpit - Pre-Final Year ECE @ MNNIT Allahabad", "", "btech"},
+		{"Sahil | LinkedIn", "Final Year CSE Student at @MNNIT Allahabad", "btech"},
+		{"Ravi | LinkedIn", "SDE @ Cisco || MTech CSE @ MNNIT Allahabad", "pg"}, // branch hint loses to M.Tech
+		{"Ravi | LinkedIn", "MCA final year, MNNIT", "pg"},
+		{"Naman - SDE | LinkedIn", "Software Engineer II @ Cisco | MNNIT'22", ""}, // year alone says nothing
+	}
+	for _, tt := range tests {
+		if got := degreeAt(testVariants, tt.title, tt.snippet); got != tt.want {
+			t.Errorf("degreeAt(%q, %q) = %q, want %q", tt.title, tt.snippet, got, tt.want)
+		}
+	}
+}
+
 func TestScore(t *testing.T) {
 	tests := []struct {
 		name, company, title, snippet string
@@ -62,6 +93,8 @@ func TestScore(t *testing.T) {
 		{"word boundary: Uber vs Uberization", "Uber", "X - Uberization lead | LinkedIn", "", 0, "low"},
 		{"no school", "Razorpay", "X - SDE - Razorpay | LinkedIn", "", 5, "medium"},
 		{"case-insensitive", "razorpay", "X - sde - RAZORPAY | LinkedIn", "mnnit", 8, "high"},
+		{"btech bonus", "Razorpay", "X - SDE - Razorpay | LinkedIn", "B.Tech, MNNIT Allahabad", 9, "high"},
+		{"mtech penalty", "Razorpay", "X - SDE - Razorpay | LinkedIn", "M.Tech, MNNIT Allahabad", 4, "medium"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

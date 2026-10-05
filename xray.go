@@ -70,7 +70,42 @@ func pastMention(text string, company *regexp.Regexp) bool {
 	return false
 }
 
+var (
+	ugDegree = regexp.MustCompile(`(?i:\bb[.\-]?\s?tech\b|\bbachelor|\bdual\s+degree\b|\bundergrad)|\bB\.\s?E\b`)
+	// Branch / year words: usually B.Tech, but only trusted when no postgrad word is nearby.
+	ugHint   = regexp.MustCompile(`(?i)\b(cse|ece|eee|computer\s+science|electronics|electrical|mechanical|civil|chemical|biotech(nology)?|(pre-?\s?)?final\s+year)\b`)
+	pgDegree = regexp.MustCompile(`(?i:\bm[.\-]?\s?tech\b|\bmaster|\bmca\b|\bmba\b|\bph\.?\s?d\b|\bm\.?\s?sc\b|\bpost\s?-?graduat)|\bM\.\s?E\b`)
+)
+
+// degreeAt guesses which degree the person did at the school from words within 40 chars of a
+// school mention: "btech", "pg", or "" when the text doesn't say (common: "Education: MNNIT").
+// Precedence: explicit B.Tech > postgrad > branch/year hint. B.Tech beating postgrad covers
+// "Dual Degree (B.Tech + M.Tech)" and errs toward showing someone rather than hiding them.
+func degreeAt(variants []string, fields ...string) string {
+	pg, hint := false, false
+	for _, f := range fields {
+		for _, v := range variants {
+			for _, loc := range wordRe(v).FindAllStringIndex(f, -1) {
+				win := f[max(0, loc[0]-40):min(len(f), loc[1]+40)]
+				if ugDegree.MatchString(win) {
+					return "btech"
+				}
+				pg = pg || pgDegree.MatchString(win)
+				hint = hint || ugHint.MatchString(win)
+			}
+		}
+	}
+	if pg {
+		return "pg"
+	}
+	if hint {
+		return "btech"
+	}
+	return ""
+}
+
 type scored struct {
+	Degree     string   `json:"degree"`
 	Score      int      `json:"score"`
 	Confidence string   `json:"confidence"`
 	Reasons    []string `json:"reasons"`
@@ -103,6 +138,12 @@ func score(company string, variants []string, title, snippet, headline string) s
 			add(2, "+2 engineering role ("+k+")")
 			break
 		}
+	}
+	switch s.Degree = degreeAt(variants, title, snippet); s.Degree {
+	case "btech":
+		add(1, "+1 B.Tech at this college")
+	case "pg":
+		add(-4, "−4 postgrad (M.Tech/MCA/MBA/PhD) at this college, not B.Tech")
 	}
 	if pastMention(both, co) {
 		add(-3, "−3 looks like a past employee (ex-/former/previously near company)")

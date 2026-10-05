@@ -57,6 +57,8 @@ CREATE TABLE api_usage (
 `, `
 ALTER TABLE people ADD COLUMN school TEXT NOT NULL DEFAULT 'mnnit';
 CREATE INDEX people_company_school ON people(company_id, school);
+`, `
+ALTER TABLE people ADD COLUMN degree TEXT NOT NULL DEFAULT '';
 `}
 
 func openDB(path string) (*sql.DB, error) {

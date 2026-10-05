@@ -44,6 +44,12 @@ func main() {
 		s:        newSearcher(db, os.Getenv("SERPER_API_KEY"), time.Duration(envInt("CACHE_TTL_DAYS", 7))*24*time.Hour),
 		maxPages: envInt("XRAY_MAX_PAGES", 3),
 	}
+	if n, err := a.rescoreAll(context.Background()); err != nil {
+		slog.Error("rescore people", "err", err)
+		os.Exit(1)
+	} else {
+		slog.Info("rescored stored people with current rules", "count", n)
+	}
 	for _, k := range []string{"SCHOOL_ID", "SCHOOL_NAME_VARIANTS"} {
 		if os.Getenv(k) != "" {
 			slog.Warn("env var is ignored now; colleges are configured in schools.go", "var", k)

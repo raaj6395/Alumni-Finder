@@ -101,6 +101,9 @@ func TestSearchFlow(t *testing.T) {
 	if p := res.People[0]; p.Name != "Asha Verma" || p.Confidence != "high" || p.ProfileURL != "https://www.linkedin.com/in/asha-verma-123" {
 		t.Errorf("top person = %+v", p)
 	}
+	if res.People[0].Degree != "" {
+		t.Errorf("fixture snippet has no degree: %+v", res.People[0])
+	}
 	if last := res.People[2]; last.Name != "Rohit K" || last.Confidence != "low" {
 		t.Errorf("ex-employee should rank last: %+v", last)
 	}

@@ -34,6 +34,7 @@ type person struct {
 	Snippet    string          `json:"snippet"`
 	Score      int             `json:"score"`
 	Confidence string          `json:"confidence"`
+	Degree     string          `json:"degree"` // btech | pg | "" (unknown)
 	Reasons    json.RawMessage `json:"reasons"`
 	Status     string          `json:"status"`
 	Notes      string          `json:"notes"`
@@ -108,7 +109,7 @@ func (a *app) listCompanies(ctx context.Context) ([]company, error) {
 
 func (a *app) listPeople(ctx context.Context, companyID int64, schoolKey string) ([]person, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT id, profile_url, name, headline, raw_title, snippet, score,
-		confidence, score_reasons, status, notes FROM people WHERE company_id=? AND school=? ORDER BY score DESC, name`, companyID, schoolKey)
+		confidence, degree, score_reasons, status, notes FROM people WHERE company_id=? AND school=? ORDER BY score DESC, name`, companyID, schoolKey)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +119,7 @@ func (a *app) listPeople(ctx context.Context, companyID int64, schoolKey string)
 		var p person
 		var reasons string
 		if err := rows.Scan(&p.ID, &p.ProfileURL, &p.Name, &p.Headline, &p.RawTitle, &p.Snippet, &p.Score,
-			&p.Confidence, &reasons, &p.Status, &p.Notes); err != nil {
+			&p.Confidence, &p.Degree, &reasons, &p.Status, &p.Notes); err != nil {
 			return nil, err
 		}
 		p.Reasons = json.RawMessage(reasons)
@@ -345,8 +346,8 @@ func (a *app) upsertPerson(ctx context.Context, tx *sql.Tx, companyID int64, com
 	case errors.Is(err, sql.ErrNoRows):
 		sum.New++
 		_, err = tx.ExecContext(ctx, `INSERT INTO people(company_id, school, profile_url, profile_slug, name, headline, raw_title,
-			snippet, score, confidence, score_reasons) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-			companyID, sch.Key, url, slug, pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, string(reasons))
+			snippet, score, confidence, degree, score_reasons) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			companyID, sch.Key, url, slug, pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, sc.Degree, string(reasons))
 		return err
 	case err != nil:
 		return err
@@ -357,10 +358,56 @@ func (a *app) upsertPerson(ctx context.Context, tx *sql.Tx, companyID int64, com
 	default: // refresh search data, keep tracker fields
 		sum.Updated++
 		_, err = tx.ExecContext(ctx, `UPDATE people SET name=?, headline=?, raw_title=?, snippet=?, score=?, confidence=?,
-			score_reasons=?, updated_at=datetime('now') WHERE profile_slug=?`,
-			pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, string(reasons), slug)
+			degree=?, score_reasons=?, updated_at=datetime('now') WHERE profile_slug=?`,
+			pname, headline, r.Title, r.Snippet, sc.Score, sc.Confidence, sc.Degree, string(reasons), slug)
 		return err
 	}
+}
+
+// rescoreAll re-applies the current scoring rules to every stored person, so rule changes
+// (like degree detection) reach old rows without spending API credits.
+func (a *app) rescoreAll(ctx context.Context) (int, error) {
+	type row struct {
+		id                     int64
+		company, school, title string
+		snippet, headline      string
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id, c.name, p.school, p.raw_title, p.snippet, p.headline
+		FROM people p JOIN companies c ON c.id = p.company_id`)
+	if err != nil {
+		return 0, err
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.company, &r.school, &r.title, &r.snippet, &r.headline); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, r := range all {
+		sch, err := schoolByKey(r.school)
+		if err != nil {
+			continue // school removed from schools.go; leave the row as is
+		}
+		sc := score(r.company, sch.Variants, r.title, r.snippet, r.headline)
+		reasons, _ := json.Marshal(sc.Reasons)
+		if _, err := tx.ExecContext(ctx, `UPDATE people SET score=?, confidence=?, degree=?, score_reasons=? WHERE id=?`,
+			sc.Score, sc.Confidence, sc.Degree, string(reasons), r.id); err != nil {
+			return 0, err
+		}
+	}
+	return len(all), tx.Commit()
 }
 
 func (a *app) updatePerson(ctx context.Context, id int64, status, notes *string) error {
